@@ -68,7 +68,8 @@ tokio-console = ["dep:console-subscriber"]
 [profile.release]
 debug = false
 strip = true
-codegen-units = 4
+codegen-units = 1
+incremental = false
 
 [profile.release-ci]
 inherits = "release"
