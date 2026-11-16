@@ -24,6 +24,7 @@ import common from "@/services/common";
 import { queryClient } from "@/composables/query/queryClient";
 import OTimeCell from "@/lib/core/Table/cells/OTimeCell.vue";
 import analytics from "@/services/product_analytics";
+import stage8 from "@/test/unit/fixtures/serviceVersions/stage8.json";
 
 vi.mock("@/services/product_analytics", () => ({ default: { track: vi.fn() } }));
 
@@ -44,6 +45,7 @@ vi.mock("@/services/downtimes", () => ({
     move: vi.fn(),
     preview: vi.fn(),
     resources: vi.fn(),
+    values: vi.fn(),
   },
 }));
 
@@ -179,6 +181,24 @@ describe("DowntimeList", () => {
     wrapper.unmount();
   });
 
+  it("words each condition as the detail does, with and without a display name", async () => {
+    vi.mocked(downtimes.values).mockResolvedValue({ data: stage8.downtime_values } as never);
+    const cases = [
+      ["service", "checkoutservice", "service=CheckoutService"],
+      ["env", "prod", "env=prod"],
+    ] as const;
+    const rows = cases.map(([key, value], i) =>
+      row({ id: `dt-${i}`, condition: { type: "pair", key, operator: "=", value } }),
+    );
+    vi.mocked(downtimes.list).mockResolvedValue(page(rows) as never);
+    const wrapper = await mountList();
+    for (const [i, [, , text]] of cases.entries()) {
+      const chip = `[data-test="downtime-list-dt-${i}-targets-condition"]`;
+      await vi.waitFor(() => expect(wrapper.get(chip).text()).toContain(text));
+    }
+    wrapper.unmount();
+  });
+
   it("shows the When column in the app's zone, the zone every downtime view uses", async () => {
     store.state.timezone = "Pacific/Chatham";
     vi.mocked(downtimes.list).mockResolvedValue(page([row()]) as never);
@@ -311,7 +331,7 @@ describe("DowntimeList", () => {
 
     await wrapper.get('[data-test="downtime-summary-scheduled"]').trigger("click");
     await flushPromises();
-    expect(wrapper.router.currentRoute.value.query.status).toBe("scheduled");
+    expect(wrapper.router.currentRoute.value.query.status).toBe("active,scheduled");
     expect(total()).toContain("1");
     wrapper.unmount();
   });
@@ -347,6 +367,27 @@ describe("DowntimeList", () => {
     await flushPromises();
     expect(shown("dt-1")).toBe(false);
     expect(shown("dt-2")).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("ORs two picked status chips and keeps both in the URL", async () => {
+    vi.mocked(downtimes.list).mockResolvedValue(
+      page([
+        row({ id: "dt-1", status: "active" }),
+        row({ id: "dt-2", status: "ended_early" }),
+        row({ id: "dt-3", status: "scheduled" }),
+      ]) as never,
+    );
+    const wrapper = await mountList({ status: "active,ended_early" });
+    const shown = (id: string) => wrapper.find(`[data-test="downtime-list-${id}-name"]`).exists();
+    await vi.waitFor(() => expect(shown("dt-1")).toBe(true));
+    expect(shown("dt-2")).toBe(true);
+    expect(shown("dt-3")).toBe(false);
+
+    await wrapper.get('[data-test="downtime-summary-active"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.router.currentRoute.value.query.status).toBe("ended_early");
+    expect(shown("dt-1")).toBe(false);
     wrapper.unmount();
   });
 

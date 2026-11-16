@@ -148,7 +148,14 @@ pub type RwBTreeMap<K, V> = tokio::sync::RwLock<BTreeMap<K, V>>;
 // 148: add alert_incidents.security_case, backfilled from SIEM detections and case group keys.
 // 149: add alert_incidents.historical, set on a security case only backfilled firings opened.
 // 150: add budget to online_eval_jobs.
-pub const DB_SCHEMA_VERSION: u64 = 150;
+// 151: add last_run_class, last_run_class_at and last_tested_at to synthetics.
+// 152: add false_alarm_by, false_alarm_at and false_alarm_reason to status_page_notices.
+// 153: add gap_since, gap_runs, gap_notified_at and gap_resumed_at to synthetics.
+// 154: add synthetics.status_recovered_at and status_streak_sig, and
+//      status_page_notices.false_alarm_recovered_at.
+// 155: create the service version, identity, alias, deploy and verdict tables.
+// 156: add alert_incidents.last_detection_at, when a new detection joined a worked case.
+pub const DB_SCHEMA_VERSION: u64 = 156;
 pub const DB_SCHEMA_KEY: &str = "/db_schema_version/";
 
 // global version variables
@@ -172,6 +179,9 @@ pub const GRPC_HTTP2_CONNECTION_WINDOW_SIZE: u32 = 16 * 1024 * 1024; // 16 MB
 pub const SIZE_IN_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MAX_FILE_SIZE_DEFAULT_CAP: usize = 512 * 1024 * 1024;
 const MAX_FILE_SIZE_DEFAULT_FLOOR: usize = 32 * 1024 * 1024;
+const JOB_RUNTIME_BLOCKING_PER_CPU: usize = 8;
+const JOB_RUNTIME_BLOCKING_FLOOR: usize = 32;
+const JOB_RUNTIME_BLOCKING_CAP: usize = 256;
 // The current value is recorded in each tantivy index file (puffin `row_group_size`
 // property) so it can be changed safely without breaking row_id → row_group mapping
 // for older files.
@@ -1127,6 +1137,7 @@ pub struct Config {
     pub public_dashboards: PublicDashboards,
     pub alert_composite: AlertComposite,
     pub db_monitoring: DatabaseMonitoring,
+    pub service_versions: ServiceVersions,
     pub self_profiles: SelfProfiles,
     pub public_ai_chat: PublicAiChat,
 }
@@ -1238,6 +1249,17 @@ pub struct DatabaseMonitoring {
         help = "Rollup window and job cadence in seconds. This is also the freshness floor: rolled-up data is up to one interval stale, and the read path covers the remainder with a live delta query over un-rolled-up spans. Lowering it shrinks that delta (cheaper reads, fresher pages) at the cost of a more frequent rollup job and more `_o2_db_stats` rows."
     )]
     pub rollup_interval_secs: u64,
+}
+
+/// Service versions as a whole; a per-org switch is not offered.
+#[derive(Debug, Serialize, EnvConfig, Default)]
+pub struct ServiceVersions {
+    #[env_config(
+        name = "ZO_SERVICE_VERSIONS_ENABLED",
+        default = true,
+        help = "Enable Service Versions: span stamping at ingest, the version registry flush and the service signals processor. false pauses all three and keeps every stored row and cursor; true resumes from the saved cursors."
+    )]
+    pub enabled: bool,
 }
 
 /// Public (unauthenticated) dashboards; clamped in `check_public_dashboards_config`.
@@ -2945,8 +2967,12 @@ pub struct Limit {
     pub grpc_runtime_blocking_worker_num: usize, // equals to 512 if 0
     #[env_config(name = "ZO_JOB_RUNTIME_WORKER_NUM", default = 0)]
     pub job_runtime_worker_num: usize, // equals to cpu_num if 0
-    #[env_config(name = "ZO_JOB_RUNTIME_BLOCKING_WORKER_NUM", default = 0)]
-    pub job_runtime_blocking_worker_num: usize, // equals to 512 if 0
+    #[env_config(
+        name = "ZO_JOB_RUNTIME_BLOCKING_WORKER_NUM",
+        default = 0,
+        help = "Max tokio blocking threads of the job runtime. 0 means cpu_num * 8, clamped to 32..256. Each blocking thread keeps its own allocator heap, so a higher cap raises resident memory after bursts."
+    )]
+    pub job_runtime_blocking_worker_num: usize,
     #[env_config(name = "ZO_WAL_RUNTIME_WORKER_NUM", default = 0)]
     pub wal_runtime_worker_num: usize, // equals to mem_table_bucket_num if 0
     #[env_config(name = "ZO_CALCULATE_STATS_INTERVAL", default = 600)] // seconds
@@ -3559,7 +3585,7 @@ pub struct Compact {
     #[env_config(
         name = "ZO_COMPACT_TANTIVY_BUILDER_THREAD_NUM",
         default = 2,
-        help = "Per-file concurrent row_group workers for tantivy index generation during compaction. Minimum 2"
+        help = "Per-file concurrent row_group workers for tantivy index generation, on ingesters and compactors. Minimum 2. Times ZO_FILE_MERGE_THREAD_NUM, it is the thread count of the shared tantivy build pool"
     )]
     pub tantivy_builder_thread_num: usize,
 }
@@ -4272,7 +4298,8 @@ fn check_limit_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
         cfg.limit.job_runtime_worker_num = cpu_num;
     }
     if cfg.limit.job_runtime_blocking_worker_num == 0 {
-        cfg.limit.job_runtime_blocking_worker_num = 512;
+        cfg.limit.job_runtime_blocking_worker_num =
+            default_job_runtime_blocking_worker_num(cpu_num);
     }
     // HACK for thread_num equal to CPU core * 4
     if cfg.limit.query_thread_num == 0 {
@@ -5026,6 +5053,13 @@ fn default_mem_table_bucket_num(
 fn default_max_file_size(mem_table_max_size: usize) -> usize {
     let mb = 1024 * 1024;
     (mem_table_max_size / 4 / mb * mb).clamp(MAX_FILE_SIZE_DEFAULT_FLOOR, MAX_FILE_SIZE_DEFAULT_CAP)
+}
+
+/// Idle blocking threads pin their allocator heaps, so the cap bounds resident memory after a
+/// burst.
+fn default_job_runtime_blocking_worker_num(cpu_num: usize) -> usize {
+    (cpu_num * JOB_RUNTIME_BLOCKING_PER_CPU)
+        .clamp(JOB_RUNTIME_BLOCKING_FLOOR, JOB_RUNTIME_BLOCKING_CAP)
 }
 
 fn check_disk_cache_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
@@ -6528,6 +6562,19 @@ mod tests {
         assert_eq!(default_mem_table_bucket_num(0, 512 * mb, 28), 1);
         assert_eq!(default_mem_table_bucket_num(32 * 1024 * mb, 0, 28), 28);
         assert_eq!(default_mem_table_bucket_num(32 * 1024 * mb, 512 * mb, 0), 1);
+    }
+
+    #[test]
+    fn test_default_job_runtime_blocking_worker_num() {
+        assert_eq!(default_job_runtime_blocking_worker_num(0), 32);
+        assert_eq!(default_job_runtime_blocking_worker_num(2), 32);
+        assert_eq!(default_job_runtime_blocking_worker_num(3), 32);
+        assert_eq!(default_job_runtime_blocking_worker_num(4), 32);
+        assert_eq!(default_job_runtime_blocking_worker_num(5), 40);
+        assert_eq!(default_job_runtime_blocking_worker_num(8), 64);
+        assert_eq!(default_job_runtime_blocking_worker_num(16), 128);
+        assert_eq!(default_job_runtime_blocking_worker_num(32), 256);
+        assert_eq!(default_job_runtime_blocking_worker_num(64), 256);
     }
 
     #[test]
